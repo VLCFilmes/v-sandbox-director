@@ -1,11 +1,17 @@
 """
 🧠 Agent Loop — O coração do LLM Sandbox Director+1
 
-Ciclo: observe → think → act → verify → repeat/stop
+v3.10.0: Arquitetura Router + Specialists
 
-O LLM vê o resultado de cada ação no histórico de mensagens.
-Se algo der errado, ele corrige sozinho (até o limite de iterações).
-Todas as ações são logadas no banco (director_sessions + director_actions).
+SmartDirector:
+  1. Router classifica instrução (4o-mini, ~$0.0005)
+  2. Specialist executa (4o-mini, tools focados)
+
+Specialists:
+  - PayloadSpecialist: posição, timing, animação, zoom (6 tools)
+  - ReplaySpecialist: cor, fonte, tamanho, bg, matting (4 tools)
+
+Fallback: SandboxDirector legado (todas as 9 tools, prompt unificado)
 """
 
 import json
@@ -20,8 +26,14 @@ from ..tools.registry import ToolRegistry
 from ..tools.observation import register_observation_tools
 from ..tools.payload import register_payload_tools
 from ..tools.render import register_render_tools
+from ..tools.pipeline_replay import register_pipeline_replay_tools
 from ..db import session as db
-from .prompts import build_system_prompt
+from .prompts import (
+    build_system_prompt,
+    build_payload_specialist_prompt,
+    build_replay_specialist_prompt,
+)
+from .router import DirectorRouter
 
 logger = logging.getLogger(__name__)
 
@@ -38,47 +50,72 @@ MODEL_COSTS = {
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Calcula custo em USD de uma chamada LLM."""
-    costs = MODEL_COSTS.get(model, MODEL_COSTS["gpt-4o"])
+    costs = MODEL_COSTS.get(model, MODEL_COSTS["gpt-4o-mini"])
     return (input_tokens * costs["input"] / 1_000_000) + (
         output_tokens * costs["output"] / 1_000_000
     )
 
 
+# ═══ Tool Groups ═══
+
+PAYLOAD_TOOLS = ["list_tracks", "get_track_items", "get_job_status",
+                 "modify_payload", "validate_payload", "re_render"]
+
+REPLAY_TOOLS = ["get_job_status",
+                "list_pipeline_checkpoints", "get_step_payload", "replay_from_step"]
+
+ALL_TOOLS = PAYLOAD_TOOLS + [t for t in REPLAY_TOOLS if t not in PAYLOAD_TOOLS]
+
+
+def _build_full_registry(config: DirectorConfig) -> ToolRegistry:
+    """Constrói registry com TODAS as tools."""
+    registry = ToolRegistry()
+    register_observation_tools(
+        registry, v_api_url=config.v_api_internal_url,
+        service_token=config.v_api_service_token,
+    )
+    register_payload_tools(
+        registry, v_api_url=config.v_api_internal_url,
+        service_token=config.v_api_service_token,
+    )
+    register_render_tools(
+        registry, v_api_url=config.v_api_internal_url,
+        service_token=config.v_api_service_token,
+        max_rerenders=config.director_max_rerenders,
+    )
+    register_pipeline_replay_tools(
+        registry, v_api_url=config.v_api_internal_url,
+        service_token=config.v_api_service_token,
+        max_replays=config.director_max_rerenders,
+    )
+    return registry
+
+
 class SandboxDirector:
     """
-    LLM Sandbox Director+1
+    Specialist Director — executa tools em loop para uma rota específica.
 
-    Agente com tools e sandbox para controle do pipeline de vídeo.
-    Invocado pelo Chatbot quando operações complexas são necessárias.
+    Pode ser usado diretamente (legacy) ou via SmartDirector (Router pattern).
     """
 
-    def __init__(self, config: DirectorConfig):
+    def __init__(
+        self,
+        config: DirectorConfig,
+        allowed_tools: list[str] = None,
+        system_prompt_override: str = None,
+    ):
         self.config = config
         self.client = AsyncOpenAI(api_key=config.openai_api_key)
-        self.registry = ToolRegistry()
+        self.system_prompt_override = system_prompt_override
 
-        # Registrar tools
-        register_observation_tools(
-            self.registry,
-            v_api_url=config.v_api_internal_url,
-            service_token=config.v_api_service_token,
-        )
-        register_payload_tools(
-            self.registry,
-            v_api_url=config.v_api_internal_url,
-            service_token=config.v_api_service_token,
-        )
-        register_render_tools(
-            self.registry,
-            v_api_url=config.v_api_internal_url,
-            service_token=config.v_api_service_token,
-            max_rerenders=config.director_max_rerenders,
-        )
+        # Construir registry completo e filtrar se necessário
+        self.registry = _build_full_registry(config)
+        self.allowed_tools = allowed_tools  # None = todas
 
+        tool_names = allowed_tools or self.registry.tool_names
         logger.info(
-            f"🤖 Director inicializado — model={config.director_model}, "
-            f"tools={self.registry.tool_names}, "
-            f"max_iter={config.director_max_iterations}"
+            f"🤖 Specialist inicializado — model={config.director_model}, "
+            f"tools={tool_names}"
         )
 
     async def execute(
@@ -87,15 +124,12 @@ class SandboxDirector:
         instruction: str,
         user_id: Optional[str] = None,
         context: Optional[dict] = None,
+        route: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """
         Agent loop: observe → think → act → verify → ...
 
-        Yields eventos conforme o Director avança:
-          {"type": "session_created", "session_id": "..."}
-          {"type": "tool_call", "iteration": 1, "tool": "list_tracks", ...}
-          {"type": "complete", "result": "...", "total_iterations": 5, ...}
-          {"type": "error", "result": "...", ...}
+        Yields eventos conforme o Director avança.
         """
         context = context or {}
 
@@ -113,12 +147,15 @@ class SandboxDirector:
         yield {"type": "session_created", "session_id": session_id}
 
         # ═══ Construir system prompt ═══
-        system_prompt = build_system_prompt(
-            max_iterations=self.config.director_max_iterations,
-            max_sandbox_calls=self.config.director_max_sandbox_calls,
-            max_rerenders=self.config.director_max_rerenders,
-            budget_limit=self.config.director_budget_limit_usd,
-        )
+        if self.system_prompt_override:
+            system_prompt = self.system_prompt_override
+        else:
+            system_prompt = build_system_prompt(
+                max_iterations=self.config.director_max_iterations,
+                max_sandbox_calls=self.config.director_max_sandbox_calls,
+                max_rerenders=self.config.director_max_rerenders,
+                budget_limit=self.config.director_budget_limit_usd,
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -128,7 +165,7 @@ class SandboxDirector:
             },
         ]
 
-        # Adicionar contexto extra se fornecido
+        # Adicionar contexto extra
         if context.get("template_id"):
             messages[-1]["content"] += f"\nTemplate: {context['template_id']}"
         if context.get("project_id"):
@@ -143,9 +180,9 @@ class SandboxDirector:
         total_cost = 0.0
         sandbox_total_time_ms = 0
 
-        # ═══ Tools no formato OpenAI ═══
+        # ═══ Tools no formato OpenAI (filtradas) ═══
         openai_tools = self.registry.get_openai_tools(
-            self.config.allowed_tools_list or None
+            self.allowed_tools or self.config.allowed_tools_list or None
         )
 
         # ═══════════════════════════════════════════════════
@@ -220,7 +257,7 @@ class SandboxDirector:
                     is_success = "error" not in result
 
                     # Contar re-renders
-                    if tool_name == "re_render" and is_success:
+                    if tool_name in ("re_render", "replay_from_step") and is_success:
                         total_rerenders += 1
 
                     # Logar ação no banco
@@ -242,7 +279,7 @@ class SandboxDirector:
                         ),
                     )
 
-                    # Resultado volta ao histórico → LLM vê na próxima iteração
+                    # Resultado volta ao histórico
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -265,13 +302,12 @@ class SandboxDirector:
                         f"{json.dumps(result, ensure_ascii=False)[:200]}"
                     )
 
-            # ── CASO 2: Resposta final (sem tool calls) ──
+            # ── CASO 2: Resposta final ──
             else:
                 result_text = assistant_message.content or "Concluído sem mensagem."
 
-                logger.info(f"✅ Director concluiu em {iteration} iterações: {result_text[:200]}")
+                logger.info(f"✅ Specialist concluiu em {iteration} iterações: {result_text[:200]}")
 
-                # Logar resposta final
                 await db.log_action(
                     session_id=session_id,
                     iteration=iteration,
@@ -286,7 +322,6 @@ class SandboxDirector:
                     ),
                 )
 
-                # Atualizar contadores e completar sessão
                 await db.update_session_counters(
                     session_id=session_id,
                     total_iterations=iteration,
@@ -311,6 +346,7 @@ class SandboxDirector:
                     "total_iterations": iteration,
                     "total_tool_calls": total_tool_calls,
                     "total_cost": round(total_cost, 6),
+                    "route": route,
                 }
                 return
 
@@ -340,3 +376,130 @@ class SandboxDirector:
             "total_iterations": self.config.director_max_iterations,
             "total_cost": round(total_cost, 6),
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+# SmartDirector — Router + Specialists
+# ═══════════════════════════════════════════════════════════════
+
+class SmartDirector:
+    """
+    🧭 Director com Router pattern.
+
+    1. Router classifica instrução (~$0.0005, ~300ms)
+    2. Specialist correto executa (tools focados, prompt menor)
+
+    Benefícios:
+    - Cada specialist tem ~50% menos tokens no prompt
+    - 4o-mini performa melhor com contexto focado
+    - Custo total: ~$0.0015/sessão (vs $0.017 com 4o)
+    """
+
+    def __init__(self, config: DirectorConfig):
+        self.config = config
+
+        # Router (usa router_model, default: gpt-4o-mini)
+        router_model = getattr(config, 'router_model', 'gpt-4o-mini')
+        self.router = DirectorRouter(
+            api_key=config.openai_api_key,
+            model=router_model,
+        )
+
+        # Payload Specialist
+        self.payload_specialist = SandboxDirector(
+            config,
+            allowed_tools=PAYLOAD_TOOLS,
+            system_prompt_override=build_payload_specialist_prompt(
+                max_iterations=config.director_max_iterations,
+                max_rerenders=config.director_max_rerenders,
+                budget_limit=config.director_budget_limit_usd,
+            ),
+        )
+
+        # Replay Specialist
+        self.replay_specialist = SandboxDirector(
+            config,
+            allowed_tools=REPLAY_TOOLS,
+            system_prompt_override=build_replay_specialist_prompt(
+                max_iterations=config.director_max_iterations,
+                max_replays=config.director_max_rerenders,
+                budget_limit=config.director_budget_limit_usd,
+            ),
+        )
+
+        logger.info(
+            f"🧭 SmartDirector inicializado — "
+            f"router={router_model}, specialist={config.director_model}, "
+            f"payload_tools={len(PAYLOAD_TOOLS)}, replay_tools={len(REPLAY_TOOLS)}"
+        )
+
+    async def execute(
+        self,
+        job_id: str,
+        instruction: str,
+        user_id: Optional[str] = None,
+        context: Optional[dict] = None,
+    ) -> AsyncIterator[dict]:
+        """
+        1. Router classifica
+        2. Specialist executa
+        """
+        context = context or {}
+
+        # ═══ Step 1: Router ═══
+        route_result = await self.router.classify(instruction, context)
+        route = route_result["route"]
+
+        yield {
+            "type": "routed",
+            "route": route,
+            "reason": route_result.get("reason", ""),
+            "router_tokens": route_result.get("tokens_input", 0) + route_result.get("tokens_output", 0),
+        }
+
+        # ═══ Step 2: Dispatch ═══
+
+        if route == "impossible":
+            reason = route_result.get("reason", "Modificação não suportada")
+            yield {
+                "type": "complete",
+                "status": "completed",
+                "result": f"Não foi possível atender: {reason}",
+                "total_iterations": 0,
+                "total_cost": calculate_cost(
+                    getattr(self.config, 'router_model', 'gpt-4o-mini'),
+                    route_result.get("tokens_input", 0),
+                    route_result.get("tokens_output", 0),
+                ),
+                "route": route,
+            }
+            return
+
+        # Selecionar specialist
+        if route == "replay":
+            specialist = self.replay_specialist
+            logger.info(f"🔄 [SMART] Roteando para ReplaySpecialist")
+        else:
+            specialist = self.payload_specialist
+            logger.info(f"📝 [SMART] Roteando para PayloadSpecialist")
+
+        # Executar specialist (yield all events)
+        async for event in specialist.execute(
+            job_id=job_id,
+            instruction=instruction,
+            user_id=user_id,
+            context=context,
+            route=route,
+        ):
+            # Enriquecer eventos com info do router
+            if event.get("type") == "complete":
+                router_cost = calculate_cost(
+                    getattr(self.config, 'router_model', 'gpt-4o-mini'),
+                    route_result.get("tokens_input", 0),
+                    route_result.get("tokens_output", 0),
+                )
+                event["total_cost"] = round(
+                    event.get("total_cost", 0) + router_cost, 6
+                )
+                event["route"] = route
+            yield event

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from .config import get_config
 from .db.session import init_db, close_db
-from .agent.loop import SandboxDirector
+from .agent.loop import SandboxDirector, SmartDirector
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -35,7 +35,8 @@ async def lifespan(app: FastAPI):
     """Startup e shutdown da aplicação."""
     config = get_config()
     logger.info("🚀 LLM Sandbox Director+1 iniciando...")
-    logger.info(f"   Modelo: {config.director_model}")
+    logger.info(f"   Router: {'✅ ' + config.router_model if config.router_enabled else '❌ desabilitado'}")
+    logger.info(f"   Specialist: {config.director_model}")
     logger.info(f"   Max iterações: {config.director_max_iterations}")
     logger.info(f"   Budget limit: ${config.director_budget_limit_usd}")
     logger.info(f"   v-api URL: {config.v_api_internal_url}")
@@ -77,6 +78,7 @@ class ExecuteResponse(BaseModel):
     total_iterations: int = 0
     total_cost_usd: float = 0.0
     actions: list = []
+    route: Optional[str] = None  # "payload", "replay", "impossible" (quando Router ativo)
 
 
 # ═══ Endpoints ═══
@@ -88,10 +90,19 @@ async def health():
     return {
         "status": "ok",
         "service": "v-sandbox-director",
-        "version": "0.1.0",
-        "model": config.director_model,
+        "version": "3.10.0",
+        "architecture": "router+specialists" if config.router_enabled else "unified",
+        "router_model": config.router_model if config.router_enabled else None,
+        "specialist_model": config.director_model,
         "max_iterations": config.director_max_iterations,
     }
+
+
+def _create_director(config):
+    """Cria SmartDirector (Router) ou SandboxDirector (legacy) conforme config."""
+    if config.router_enabled:
+        return SmartDirector(config)
+    return SandboxDirector(config)
 
 
 @app.post("/execute", response_model=ExecuteResponse)
@@ -99,20 +110,22 @@ async def execute_director(request: ExecuteRequest):
     """
     Executa o Director para um job específico.
 
-    O Director:
-    1. Lê o payload do job (via v-api)
-    2. Analisa a instrução
-    3. Executa tools/sandbox em loop até resolver
-    4. Retorna resultado
+    Se Router habilitado (default):
+    1. Router classifica instrução (~300ms)
+    2. Specialist executa com tools focados
+
+    Se Router desabilitado:
+    1. SandboxDirector legado com todas as tools
 
     Todas as ações são logadas no banco (director_sessions + director_actions).
     """
     config = get_config()
-    director = SandboxDirector(config)
+    director = _create_director(config)
 
     actions = []
     final_result = None
     session_id = None
+    route = None
 
     try:
         async for event in director.execute(
@@ -125,6 +138,14 @@ async def execute_director(request: ExecuteRequest):
 
             if event_type == "session_created":
                 session_id = event["session_id"]
+
+            elif event_type == "routed":
+                route = event.get("route")
+                actions.append({
+                    "type": "routed",
+                    "route": route,
+                    "reason": event.get("reason", ""),
+                })
 
             elif event_type == "tool_call":
                 actions.append({
@@ -154,6 +175,7 @@ async def execute_director(request: ExecuteRequest):
             total_iterations=final_result.get("total_iterations", 0) if final_result else 0,
             total_cost_usd=final_result.get("total_cost", 0.0) if final_result else 0.0,
             actions=actions,
+            route=route or final_result.get("route") if final_result else None,
         )
 
     except Exception as e:
@@ -167,10 +189,10 @@ async def execute_director_stream(request: ExecuteRequest):
     Executa o Director com streaming SSE.
 
     Cada evento é enviado como SSE conforme o Director avança.
-    Útil para o frontend mostrar progresso em tempo real.
+    Inclui evento "routed" quando Router está habilitado.
     """
     config = get_config()
-    director = SandboxDirector(config)
+    director = _create_director(config)
 
     async def event_generator():
         try:

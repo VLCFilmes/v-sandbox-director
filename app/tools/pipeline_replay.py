@@ -1,0 +1,320 @@
+"""
+🔄 Tools de Pipeline Replay — Re-execução parcial do pipeline.
+
+v3.10.0: Permite ao Director re-executar partes do pipeline
+com modificações no estado (ex: mudar cor do texto → re-gerar PNGs).
+
+Ferramentas:
+- list_pipeline_checkpoints: Listar checkpoints salvos de um job
+- get_step_payload: Inspecionar estado completo de um step
+- replay_from_step: Re-executar pipeline a partir de um step com modificações
+
+Todas chamam o v-api via HTTP interno.
+"""
+
+import httpx
+import logging
+from typing import Optional
+
+from .registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+
+# Mapa de step → tipo de modificação (para descrições informativas)
+STEP_MODIFICATION_MAP = {
+    "generate_pngs": "Cor, fonte, tamanho e estilo do texto",
+    "add_shadows": "Sombras e efeitos visuais",
+    "apply_animations": "Animações de entrada/saída",
+    "calculate_positions": "Posição das legendas no canvas",
+    "generate_backgrounds": "Backgrounds e cartelas (cores, estilo)",
+    "motion_graphics": "Motion graphics (Manim)",
+    "matting": "Matting (pessoa recortada on/off)",
+    "subtitle_pipeline": "Layout final de tracks e composição",
+    "render": "Re-renderização com payload atual",
+}
+
+
+def register_pipeline_replay_tools(
+    registry: ToolRegistry,
+    v_api_url: str,
+    service_token: str,
+    max_replays: int = 2,
+):
+    """Registra tools de Pipeline Replay no registry."""
+
+    headers = {
+        "Authorization": f"Bearer {service_token}",
+        "apikey": service_token,
+        "Content-Type": "application/json",
+    }
+
+    _replay_count = {"value": 0}
+
+    # ═══ list_pipeline_checkpoints ═══
+    async def list_pipeline_checkpoints(job_id: str) -> dict:
+        """
+        Lista checkpoints salvos de um job — mostra quais steps têm
+        dados salvos para replay.
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{v_api_url}/api/video/job/{job_id}/checkpoints",
+                headers=headers,
+            )
+
+            if resp.status_code != 200:
+                return {"error": f"Erro ao buscar checkpoints: {resp.status_code} - {resp.text}"}
+
+            data = resp.json()
+            checkpoints = data.get("checkpoints", [])
+
+            # Enriquecer com informação de modificação
+            for cp in checkpoints:
+                step = cp.get("step_name", "")
+                cp["modifiable"] = step in STEP_MODIFICATION_MAP
+                cp["modification_type"] = STEP_MODIFICATION_MAP.get(step, "")
+
+            return {
+                "job_id": job_id,
+                "checkpoint_count": len(checkpoints),
+                "checkpoints": checkpoints,
+                "replay_steps_available": [
+                    cp["step_name"] for cp in checkpoints
+                    if cp.get("modifiable")
+                ],
+            }
+
+    registry.register(
+        name="list_pipeline_checkpoints",
+        description=(
+            "Lista checkpoints do pipeline salvos para um job. "
+            "Cada checkpoint é o estado completo após um step executar. "
+            "Use ANTES de replay_from_step para saber quais steps têm dados. "
+            "Mostra: step_name, duration_ms, completed_steps, e quais steps "
+            "permitem replay com modificações."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "ID do job cujos checkpoints serão listados",
+                },
+            },
+            "required": ["job_id"],
+        },
+        handler=list_pipeline_checkpoints,
+    )
+
+    # ═══ get_step_payload ═══
+    async def get_step_payload(
+        job_id: str,
+        step_name: str,
+    ) -> dict:
+        """
+        Retorna o estado completo do pipeline após um step executar.
+        Usado para inspecionar campos antes de replay.
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{v_api_url}/api/video/job/{job_id}/checkpoints/{step_name}",
+                headers=headers,
+            )
+
+            if resp.status_code == 404:
+                return {
+                    "error": f"Checkpoint não encontrado para step '{step_name}'. "
+                    "Use list_pipeline_checkpoints para ver steps disponíveis.",
+                    "not_found": True,
+                }
+
+            if resp.status_code != 200:
+                return {"error": f"Erro ao buscar checkpoint: {resp.status_code} - {resp.text}"}
+
+            data = resp.json()
+            state = data.get("state", {})
+
+            # Retornar campos mais relevantes para o Director
+            # (evitar devolver o state inteiro que pode ser enorme)
+            relevant_fields = {
+                "text_styles": state.get("text_styles"),
+                "template_id": state.get("template_id"),
+                "template_config": _summarize_template_config(state.get("template_config")),
+                "video_width": state.get("video_width"),
+                "video_height": state.get("video_height"),
+                "total_duration_ms": state.get("total_duration_ms"),
+                "phrase_groups_count": len(state.get("phrase_groups") or []),
+                "completed_steps": state.get("completed_steps", []),
+                "has_png_results": state.get("png_results") is not None,
+                "has_shadow_results": state.get("shadow_results") is not None,
+                "has_animation_results": state.get("animation_results") is not None,
+                "has_positioning_results": state.get("positioning_results") is not None,
+                "has_background_results": state.get("background_results") is not None,
+            }
+
+            # Se step é generate_pngs, incluir text_styles detalhado
+            if step_name in ("generate_pngs", "classify", "load_template"):
+                tc = state.get("template_config") or {}
+                tm = tc.get("template-mode") or tc.get("template_mode") or {}
+                relevant_fields["text_styles_full"] = tm.get("text_styles")
+                relevant_fields["animation_config"] = tm.get("animation_config")
+                relevant_fields["shadow_config"] = tm.get("shadow_config")
+
+            return {
+                "job_id": job_id,
+                "step_name": step_name,
+                "found": True,
+                "state_summary": relevant_fields,
+                "modification_type": STEP_MODIFICATION_MAP.get(step_name, ""),
+                "hint": (
+                    f"Para modificar, use replay_from_step com o step '{step_name}' "
+                    f"e as modificações desejadas em formato dot-notation."
+                    if step_name in STEP_MODIFICATION_MAP
+                    else f"Step '{step_name}' não é um alvo comum de replay."
+                ),
+            }
+
+    registry.register(
+        name="get_step_payload",
+        description=(
+            "Retorna o estado do pipeline após um step específico executar. "
+            "Use para INSPECIONAR campos antes de decidir quais modificações "
+            "fazer no replay. Mostra: text_styles, template_config, contagens, etc. "
+            "SEMPRE use após list_pipeline_checkpoints para validar que o step existe."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "ID do job",
+                },
+                "step_name": {
+                    "type": "string",
+                    "description": (
+                        "Nome do step para inspecionar. "
+                        "Ex: 'classify' (antes de generate_pngs), "
+                        "'generate_pngs', 'add_shadows', etc."
+                    ),
+                },
+            },
+            "required": ["job_id", "step_name"],
+        },
+        handler=get_step_payload,
+    )
+
+    # ═══ replay_from_step ═══
+    async def replay_from_step(
+        job_id: str,
+        step_name: str,
+        modifications: dict,
+    ) -> dict:
+        """
+        Re-executa o pipeline a partir de um step com modificações.
+        Cria um novo job e enfileira para processamento.
+        """
+        _replay_count["value"] += 1
+        if _replay_count["value"] > max_replays:
+            return {
+                "error": f"Limite de replays atingido ({max_replays}). "
+                "Não é possível fazer mais replays nesta sessão.",
+                "limit_reached": True,
+            }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{v_api_url}/api/video/job/{job_id}/replay-from/{step_name}",
+                headers=headers,
+                json={"modifications": modifications},
+            )
+
+            if resp.status_code == 400:
+                error_data = resp.json()
+                return {
+                    "error": error_data.get("error", "Erro de validação"),
+                    "success": False,
+                }
+
+            if resp.status_code not in (200, 202):
+                return {"error": f"Erro no replay: {resp.status_code} - {resp.text}"}
+
+            result = resp.json()
+            return {
+                "success": True,
+                "new_job_id": result.get("new_job_id"),
+                "original_job_id": job_id,
+                "replaying_from": step_name,
+                "steps_to_run": result.get("steps_to_run", []),
+                "estimated_time_seconds": result.get("estimated_time_seconds", 30),
+                "modifications_applied": result.get("modifications_applied", 0),
+                "replay_count": _replay_count["value"],
+                "remaining_replays": max_replays - _replay_count["value"],
+                "message": (
+                    f"Pipeline replay iniciado a partir de '{step_name}'. "
+                    f"Novo job: {result.get('new_job_id', 'N/A')[:8]}... "
+                    f"Estimativa: ~{result.get('estimated_time_seconds', 30)}s."
+                ),
+            }
+
+    registry.register(
+        name="replay_from_step",
+        description=(
+            "Re-executa o pipeline a partir de um step com modificações no estado. "
+            "CRIA UM NOVO JOB — o vídeo será re-processado do step alvo até o render. "
+            "Use quando a modificação exige re-gerar assets (cor, fonte, tamanho do texto, "
+            "backgrounds, sombras). "
+            f"Limite: {max_replays} replays por sessão. "
+            "ATENÇÃO: Replay é mais custoso que modify_payload. "
+            "Prefira modify_payload para posição, timing, animação, zoom. "
+            "Use replay APENAS quando a modificação exige re-gerar PNGs/assets. "
+            "SEMPRE inspecione com get_step_payload antes de fazer replay."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "ID do job original (que tem checkpoints salvos)",
+                },
+                "step_name": {
+                    "type": "string",
+                    "description": (
+                        "Step a partir do qual re-executar. Exemplos:\n"
+                        "- 'generate_pngs': mudar cor/fonte/tamanho do texto\n"
+                        "- 'add_shadows': mudar sombras\n"
+                        "- 'calculate_positions': mudar posição das legendas\n"
+                        "- 'generate_backgrounds': mudar backgrounds/cartelas\n"
+                        "- 'motion_graphics': re-gerar motion graphics\n"
+                        "- 'matting': ativar/desativar matting"
+                    ),
+                },
+                "modifications": {
+                    "type": "object",
+                    "description": (
+                        "Modificações em formato dot-notation. Exemplos:\n"
+                        '{"text_styles.default.fill_color": "#0000FF"}\n'
+                        '{"text_styles.emphasis.font_size": 48}\n'
+                        '{"template_config.template-mode.shadow_config.shadow_color": "#000000"}'
+                    ),
+                },
+            },
+            "required": ["job_id", "step_name", "modifications"],
+        },
+        handler=replay_from_step,
+    )
+
+    logger.info(f"🔧 {3} tools de Pipeline Replay registradas (max replays: {max_replays})")
+
+
+def _summarize_template_config(tc: dict) -> Optional[dict]:
+    """Resumo do template_config (evitar payload enorme)."""
+    if not tc:
+        return None
+    return {
+        "template_id": tc.get("template_id") or tc.get("id"),
+        "template_name": tc.get("name"),
+        "has_text_styles": "text_styles" in tc.get("template-mode", tc.get("template_mode", {})),
+        "has_animation_config": "animation_config" in tc.get("template-mode", tc.get("template_mode", {})),
+        "has_shadow_config": "shadow_config" in tc.get("template-mode", tc.get("template_mode", {})),
+    }

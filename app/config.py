@@ -14,8 +14,12 @@ class DirectorConfig(BaseSettings):
 
     # ═══ LLM ═══
     openai_api_key: str
-    director_model: str = "gpt-4o"
+    director_model: str = "gpt-4o-mini"
     director_temperature: float = 0.1
+
+    # ═══ Router ═══
+    router_model: str = "gpt-4o-mini"          # Modelo do classificador (barato)
+    router_enabled: bool = True                 # False = fallback para Director unificado
 
     # ═══ Controles do Agent Loop ═══
     director_max_iterations: int = 10
