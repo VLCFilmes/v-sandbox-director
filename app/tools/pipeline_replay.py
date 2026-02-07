@@ -153,24 +153,49 @@ def register_pipeline_replay_tools(
                 "has_background_results": state.get("background_results") is not None,
             }
 
-            # Se step é generate_pngs, incluir text_styles detalhado
+            # Se step é generate_pngs ou anterior, extrair modifiable_fields
+            # com paths EXATOS para a LLM usar diretamente
+            modifiable_fields = {}
             if step_name in ("generate_pngs", "classify", "load_template"):
-                tc = state.get("template_config") or {}
-                tm = tc.get("template-mode") or tc.get("template_mode") or {}
-                relevant_fields["text_styles_full"] = tm.get("text_styles")
-                relevant_fields["animation_config"] = tm.get("animation_config")
-                relevant_fields["shadow_config"] = tm.get("shadow_config")
+                ts = state.get("text_styles", {})
+                default_ts = ts.get("default") or {}
+                
+                # Extrair campos com paths exatos para replay
+                fc = default_ts.get("font_config") or {}
+                hl = default_ts.get("highlight") or {}
+                bg = default_ts.get("background") or {}
+                shadow = default_ts.get("shadow") or {}
+                
+                modifiable_fields = {
+                    "text_styles.default.font_config.font_color.value": _safe_value(fc, "font_color"),
+                    "text_styles.default.font_config.font_family.value": _safe_value(fc, "font_family"),
+                    "text_styles.default.font_config.font_size.value": _safe_value(fc, "font_size"),
+                    "text_styles.default.font_config.weight": fc.get("weight"),
+                    "text_styles.default.font_config.uppercase": fc.get("uppercase"),
+                    "text_styles.default.highlight.color.value": _safe_value(hl, "color"),
+                    "text_styles.default.highlight.style.value": _safe_value(hl, "style"),
+                    "text_styles.default.highlight.enabled.value": _safe_value(hl, "enabled"),
+                    "text_styles.default.background.color.value": _safe_value(bg, "color"),
+                    "text_styles.default.background.enabled": bg.get("enabled"),
+                    "text_styles.default.shadow.enabled.value": _safe_value(shadow, "enabled"),
+                }
+                # Borders
+                borders = default_ts.get("borders") or []
+                if borders:
+                    modifiable_fields["text_styles.default.borders[0].color_rgb"] = borders[0].get("color_rgb")
+                    modifiable_fields["text_styles.default.borders[0].thickness"] = borders[0].get("thickness")
 
             return {
                 "job_id": job_id,
                 "step_name": step_name,
                 "found": True,
                 "state_summary": relevant_fields,
+                "modifiable_fields": modifiable_fields if modifiable_fields else None,
                 "modification_type": STEP_MODIFICATION_MAP.get(step_name, ""),
                 "hint": (
-                    f"Para modificar, use replay_from_step com o step '{step_name}' "
-                    f"e as modificações desejadas em formato dot-notation."
-                    if step_name in STEP_MODIFICATION_MAP
+                    "Use os paths EXATOS de modifiable_fields no replay_from_step. "
+                    "Cores são arrays [R,G,B,A]. Campos com .value devem ter APENAS o valor, não o objeto inteiro."
+                    if modifiable_fields
                     else f"Step '{step_name}' não é um alvo comum de replay."
                 ),
             }
@@ -292,10 +317,11 @@ def register_pipeline_replay_tools(
                 "modifications": {
                     "type": "object",
                     "description": (
-                        "Modificações em formato dot-notation. Exemplos:\n"
-                        '{"text_styles.default.fill_color": "#0000FF"}\n'
-                        '{"text_styles.emphasis.font_size": 48}\n'
-                        '{"template_config.template-mode.shadow_config.shadow_color": "#000000"}'
+                        "Modificações em formato dot-notation. Cores são arrays RGBA [R,G,B,A]. Exemplos:\n"
+                        '{"text_styles.default.font_config.font_color.value": [0, 0, 255, 255]}\n'
+                        '{"text_styles.default.highlight.color.value": [0, 255, 0, 255]}\n'
+                        '{"text_styles.default.font_config.font_size.value": 48}\n'
+                        '{"text_styles.default.font_config.font_family.value": "Poppins"}'
                     ),
                 },
             },
@@ -305,6 +331,14 @@ def register_pipeline_replay_tools(
     )
 
     logger.info(f"🔧 {3} tools de Pipeline Replay registradas (max replays: {max_replays})")
+
+
+def _safe_value(parent: dict, key: str):
+    """Extract .value from a {value, sidecar_id} field, or None."""
+    field = parent.get(key)
+    if isinstance(field, dict) and "value" in field:
+        return field["value"]
+    return field
 
 
 def _summarize_template_config(tc: dict) -> Optional[dict]:

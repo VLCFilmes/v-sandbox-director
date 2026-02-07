@@ -134,17 +134,28 @@ def build_replay_specialist_prompt(
 
 {_SHARED_CONTEXT}
 
-## Mapa: O que mudar → Step alvo → Campo
+## Mapa: O que mudar → Step alvo → Campo EXATO (dot-notation)
 
-| Modificação | Step alvo | Campo (dot-notation) |
-|---|---|---|
-| Cor do texto | `generate_pngs` | `text_styles.default.fill_color` |
-| Cor do destaque | `generate_pngs` | `text_styles.emphasis.fill_color` |
-| Fonte | `generate_pngs` | `text_styles.default.font_family` |
-| Tamanho da fonte | `generate_pngs` | `text_styles.default.font_size` |
-| Sombras | `add_shadows` | template_config shadow_config |
-| Backgrounds | `generate_backgrounds` | template_config background |
-| Matting on/off | `matting` | matting_enabled |
+IMPORTANTE: Os campos de text_styles usam a estrutura `{{"value": X, "sidecar_id": "..."}}`.
+Você SEMPRE deve alterar o subcampo `.value` — NUNCA substitua o objeto inteiro.
+Cores são arrays RGBA: `[R, G, B, A]` onde cada valor é 0-255.
+
+| Modificação | Step alvo | Campo EXATO | Formato do valor |
+|---|---|---|---|
+| Cor do texto | `generate_pngs` | `text_styles.default.font_config.font_color.value` | `[R, G, B, A]` ex: `[0, 0, 255, 255]` |
+| Cor do destaque/highlight | `generate_pngs` | `text_styles.default.highlight.color.value` | `[R, G, B, A]` ex: `[0, 255, 0, 255]` |
+| Estilo do destaque | `generate_pngs` | `text_styles.default.highlight.style.value` | string: `"soft"`, `"box"`, `"underline"` |
+| Destaque on/off | `generate_pngs` | `text_styles.default.highlight.enabled.value` | `true` / `false` |
+| Fonte (família) | `generate_pngs` | `text_styles.default.font_config.font_family.value` | string: `"Quicksand"`, `"Poppins"` |
+| Tamanho da fonte | `generate_pngs` | `text_styles.default.font_config.font_size.value` | integer: `44`, `52`, `36` |
+| Negrito (weight) | `generate_pngs` | `text_styles.default.font_config.weight` | integer: `400`, `700`, `900` |
+| Uppercase | `generate_pngs` | `text_styles.default.font_config.uppercase` | `true` / `false` |
+| Border do texto | `generate_pngs` | `text_styles.default.borders[0].color_rgb` | string: `"R,G,B"` ex: `"0,0,0"` |
+| Border espessura | `generate_pngs` | `text_styles.default.borders[0].thickness` | integer: `0`-`30` |
+| BG do texto cor | `generate_pngs` | `text_styles.default.background.color.value` | `[R, G, B, A]` |
+| BG do texto on/off | `generate_pngs` | `text_styles.default.background.enabled` | `true` / `false` |
+| Sombra on/off | `generate_pngs` | `text_styles.default.shadow.enabled.value` | `true` / `false` |
+| Matting on/off | `matting` | matting_enabled | `true` / `false` |
 
 ## Tools disponíveis
 - **list_pipeline_checkpoints**: Ver checkpoints salvos do job
@@ -157,13 +168,26 @@ def build_replay_specialist_prompt(
 2. get_step_payload(job_id, step_anterior_ao_alvo) → inspecionar campos atuais
 3. replay_from_step(job_id, step_alvo, modifications) → re-executar
 
-## Exemplo: "Mude a cor do texto para azul"
-1. list_pipeline_checkpoints(job_id) → confirmar que "classify" tem checkpoint
-2. get_step_payload(job_id, "classify") → ver text_styles.default.fill_color = "#FFFFFF"
+## Exemplo: "Mude a cor do destaque para verde"
+1. list_pipeline_checkpoints(job_id) → confirmar que "generate_pngs" tem checkpoint
+2. get_step_payload(job_id, "generate_pngs") → ver modifiable_fields com paths exatos
 3. replay_from_step(job_id, "generate_pngs", {{
-     "text_styles.default.fill_color": "#0000FF",
-     "text_styles.emphasis.fill_color": "#3366FF"
+     "text_styles.default.highlight.color.value": [0, 255, 0, 255]
    }})
+
+## Exemplo: "Mude a cor do texto para azul e a fonte para Poppins"
+1. list_pipeline_checkpoints(job_id) → confirmar checkpoints
+2. get_step_payload(job_id, "generate_pngs") → ver campos atuais
+3. replay_from_step(job_id, "generate_pngs", {{
+     "text_styles.default.font_config.font_color.value": [0, 0, 255, 255],
+     "text_styles.default.font_config.font_family.value": "Poppins"
+   }})
+
+## REGRAS CRÍTICAS
+- SEMPRE use os paths COMPLETOS começando com `text_styles.default.`
+- SEMPRE termine com `.value` nos campos que têm {{value, sidecar_id}}
+- Cores são SEMPRE arrays `[R, G, B, A]` — NUNCA strings
+- Se get_step_payload retornar `modifiable_fields`, use ESSES paths exatos
 
 ## Limites
 - Máximo {max_iterations} iterações.
