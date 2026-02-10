@@ -157,6 +157,41 @@ Cores são arrays RGBA: `[R, G, B, A]` onde cada valor é 0-255.
 | Sombra on/off | `generate_pngs` | `text_styles.default.shadow.enabled.value` | `true` / `false` |
 | Matting on/off | `matting` | matting_enabled | `true` / `false` |
 
+### Corte de Silêncios (step alvo: `detect_silence`)
+
+Replay a partir de `detect_silence` re-executa: detect_silence → silence_cut → transcribe → ... → render.
+Campos em `options.*` (dot-notation):
+
+| Modificação | Campo EXATO | Formato | Dica |
+|---|---|---|---|
+| Sensibilidade geral | `options.min_silence_duration` | float (segundos) | Menor = mais agressivo. Default: `0.5`. Range: `0.2`–`1.5` |
+| Offset do threshold | `options.threshold_offset` | integer (dB) | Menor = mais agressivo. Default: `3`. Range: `1`–`7` |
+| Threshold fixo (dB) | `options.silence_threshold` | float (dB negativo) | Mais alto (ex: -30) = mais agressivo. Se setado, ignora auto-detect |
+| Duração mínima de fala | `options.min_speech_duration` | float (segundos) | Menor = mais agressivo. Default: `0.4`. Range: `0.1`–`1.0` |
+| Modo de corte | `options.cut_mode` | string | `"all_silences"` (default), `"hybrid"`, `"edges_only"` |
+| Cortar início do vídeo | `options.trim_start` | float (segundos) | Remove X segundos do início |
+| Cortar final do vídeo | `options.trim_end` | float (segundos) | Remove X segundos do final |
+
+**Exemplos de ajuste:**
+- "Cortar mais agressivamente" → diminuir `min_silence_duration` (ex: 0.5→0.3) E/OU diminuir `threshold_offset` (ex: 3→1)
+- "Deixar mais respiração" → aumentar `min_silence_duration` (ex: 0.5→0.8) E/OU aumentar `threshold_offset` (ex: 3→5)
+- "Tirar só os silêncios grandes" → aumentar `min_silence_duration` (ex: 0.5→1.0)
+- "Cortar só bordas" → `options.cut_mode` = `"edges_only"`
+
+### Posicionamento de B-Rolls (step alvo: `video_clipper`)
+
+Replay a partir de `video_clipper` re-executa: video_clipper → ... → render.
+O Video Clipper usa LLM para posicionar b-rolls no timeline via cruzamento semântico.
+NÃO há campos dot-notation diretos — o step regenera o EDL via LLM automaticamente.
+
+Para forçar regeneração: use replay_from_step com `modifications: {{}}` (vazio).
+O cache do EDL é limpo automaticamente durante o replay.
+
+**Quando usar:**
+- "Reposicionar b-rolls" → replay from `video_clipper` com modifications vazio
+- "Remover todos os b-rolls" → replay from `render` com modifications vazio (o render já lida com video_clipper_track=null)
+- "B-rolls estão aparecendo demais/pouco" → replay from `video_clipper`
+
 ## Tools disponíveis
 - **list_pipeline_checkpoints**: Ver checkpoints salvos do job
 - **get_step_payload**: Inspecionar estado de um step (text_styles, configs)
@@ -183,11 +218,34 @@ Cores são arrays RGBA: `[R, G, B, A]` onde cada valor é 0-255.
      "text_styles.default.font_config.font_family.value": "Poppins"
    }})
 
+## Exemplo: "Cortar os silêncios mais agressivamente"
+1. list_pipeline_checkpoints(job_id) → confirmar que "detect_silence" tem checkpoint
+2. get_step_payload(job_id, "detect_silence") → ver silence_options atuais
+3. replay_from_step(job_id, "detect_silence", {{
+     "options.min_silence_duration": 0.3,
+     "options.threshold_offset": 1
+   }})
+
+## Exemplo: "Deixar mais respiração entre as frases"
+1. list_pipeline_checkpoints(job_id) → confirmar checkpoints
+2. get_step_payload(job_id, "detect_silence") → ver silence_options atuais
+3. replay_from_step(job_id, "detect_silence", {{
+     "options.min_silence_duration": 0.8,
+     "options.threshold_offset": 5
+   }})
+
+## Exemplo: "Reposicionar os b-rolls" / "Os b-rolls estão aparecendo em momento errado"
+1. list_pipeline_checkpoints(job_id) → confirmar que "video_clipper" tem checkpoint
+2. replay_from_step(job_id, "video_clipper", {{}})
+   (O Video Clipper regenera o EDL inteiro via LLM)
+
 ## REGRAS CRÍTICAS
-- SEMPRE use os paths COMPLETOS começando com `text_styles.default.`
+- SEMPRE use os paths COMPLETOS começando com `text_styles.default.` para campos de texto
 - SEMPRE termine com `.value` nos campos que têm {{value, sidecar_id}}
 - Cores são SEMPRE arrays `[R, G, B, A]` — NUNCA strings
 - Se get_step_payload retornar `modifiable_fields`, use ESSES paths exatos
+- Para silêncios, use paths começando com `options.`
+- Para b-rolls, use replay com modifications vazio (o Video Clipper regenera via LLM)
 
 ## Limites
 - Máximo {max_iterations} iterações.
@@ -227,6 +285,8 @@ def build_system_prompt(
 - Sombras → replay de `add_shadows`
 - Backgrounds → replay de `generate_backgrounds`
 - Matting → replay de `matting`
+- Corte de silêncios → replay de `detect_silence`
+- Reposicionar b-rolls → replay de `video_clipper`
 
 ## DECISÃO: modify_payload vs replay_from_step
 "A modificação afeta algo renderizado como PNG?"

@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Mapa de step → tipo de modificação (para descrições informativas)
 STEP_MODIFICATION_MAP = {
+    "detect_silence": "Corte de silêncios (sensibilidade, threshold, modo de corte)",
+    "silence_cut": "Corte de silêncios (re-executa a partir do corte)",
     "generate_pngs": "Cor, fonte, tamanho e estilo do texto",
     "add_shadows": "Sombras e efeitos visuais",
     "apply_animations": "Animações de entrada/saída",
@@ -30,6 +32,7 @@ STEP_MODIFICATION_MAP = {
     "generate_backgrounds": "Backgrounds e cartelas (cores, estilo)",
     "motion_graphics": "Motion graphics (Manim)",
     "matting": "Matting (pessoa recortada on/off)",
+    "video_clipper": "Posicionamento de b-rolls (re-gera EDL via LLM semântica)",
     "subtitle_pipeline": "Layout final de tracks e composição",
     "render": "Re-renderização com payload atual",
 }
@@ -185,6 +188,87 @@ def register_pipeline_replay_tools(
                     modifiable_fields["text_styles.default.borders[0].color_rgb"] = borders[0].get("color_rgb")
                     modifiable_fields["text_styles.default.borders[0].thickness"] = borders[0].get("thickness")
 
+            # ═══ Silence cutting fields ═══
+            elif step_name in ("detect_silence", "silence_cut"):
+                opts = state.get("options") or {}
+                modifiable_fields = {
+                    "options.min_silence_duration": opts.get("min_silence_duration", 0.5),
+                    "options.threshold_offset": opts.get("threshold_offset", 3),
+                    "options.silence_threshold": opts.get("silence_threshold"),
+                    "options.min_speech_duration": opts.get("min_speech_duration", 0.4),
+                    "options.cut_mode": opts.get("cut_mode", "all_silences"),
+                    "options.trim_start": opts.get("trim_start"),
+                    "options.trim_end": opts.get("trim_end"),
+                }
+                # Adicionar estatísticas de silêncio se disponíveis
+                silence_detection = state.get("silence_detection")
+                if silence_detection:
+                    silence_segs = (
+                        silence_detection if isinstance(silence_detection, list)
+                        else silence_detection.get("segments", [])
+                    )
+                    total_silence = sum(
+                        (s.get("end", 0) - s.get("start", 0))
+                        for s in silence_segs
+                    )
+                    relevant_fields["silence_stats"] = {
+                        "segments_detected": len(silence_segs),
+                        "total_silence_seconds": round(total_silence, 2),
+                    }
+                cut_timestamps = state.get("cut_timestamps")
+                if cut_timestamps:
+                    cut_list = cut_timestamps if isinstance(cut_timestamps, list) else []
+                    relevant_fields["cut_stats"] = {
+                        "segments_after_cut": len(cut_list),
+                    }
+
+            # ═══ Video Clipper fields ═══
+            elif step_name == "video_clipper":
+                video_clipper_track = state.get("video_clipper_track")
+                modifiable_fields = {
+                    "_info": (
+                        "O Video Clipper re-gera o EDL inteiro via LLM semântica. "
+                        "Para reposicionar b-rolls, faça replay com modifications vazio: {}. "
+                        "O cache do EDL é limpo automaticamente."
+                    ),
+                }
+                if video_clipper_track:
+                    relevant_fields["video_clipper_stats"] = {
+                        "b_roll_placements": len(video_clipper_track),
+                        "placements_summary": [
+                            {
+                                "src": p.get("src", "")[-40:] if p.get("src") else "N/A",
+                                "start_time_ms": p.get("start_time"),
+                                "end_time_ms": p.get("end_time"),
+                                "duration_ms": (
+                                    (p.get("end_time") or 0) - (p.get("start_time") or 0)
+                                ),
+                            }
+                            for p in video_clipper_track[:10]  # max 10 para não poluir
+                        ],
+                    }
+
+            # Gerar hint baseado no tipo
+            if modifiable_fields and step_name in ("detect_silence", "silence_cut"):
+                hint = (
+                    "Use os paths EXATOS de modifiable_fields no replay_from_step. "
+                    "Para cortar mais agressivamente: diminua min_silence_duration e threshold_offset. "
+                    "Para deixar mais respiro: aumente esses valores."
+                )
+            elif modifiable_fields and step_name == "video_clipper":
+                hint = (
+                    "O Video Clipper regenera o EDL inteiro via LLM. "
+                    "Para reposicionar b-rolls, faça replay_from_step com modifications={}. "
+                    "O step re-analisa a transcrição e os b-rolls disponíveis."
+                )
+            elif modifiable_fields:
+                hint = (
+                    "Use os paths EXATOS de modifiable_fields no replay_from_step. "
+                    "Cores são arrays [R,G,B,A]. Campos com .value devem ter APENAS o valor, não o objeto inteiro."
+                )
+            else:
+                hint = f"Step '{step_name}' não é um alvo comum de replay."
+
             return {
                 "job_id": job_id,
                 "step_name": step_name,
@@ -192,12 +276,7 @@ def register_pipeline_replay_tools(
                 "state_summary": relevant_fields,
                 "modifiable_fields": modifiable_fields if modifiable_fields else None,
                 "modification_type": STEP_MODIFICATION_MAP.get(step_name, ""),
-                "hint": (
-                    "Use os paths EXATOS de modifiable_fields no replay_from_step. "
-                    "Cores são arrays [R,G,B,A]. Campos com .value devem ter APENAS o valor, não o objeto inteiro."
-                    if modifiable_fields
-                    else f"Step '{step_name}' não é um alvo comum de replay."
-                ),
+                "hint": hint,
             }
 
     registry.register(
@@ -205,7 +284,9 @@ def register_pipeline_replay_tools(
         description=(
             "Retorna o estado do pipeline após um step específico executar. "
             "Use para INSPECIONAR campos antes de decidir quais modificações "
-            "fazer no replay. Mostra: text_styles, template_config, contagens, etc. "
+            "fazer no replay. Mostra: text_styles, template_config, silence_options, "
+            "video_clipper_stats, contagens, etc. "
+            "Para silêncio use step 'detect_silence'. Para b-rolls use step 'video_clipper'. "
             "SEMPRE use após list_pipeline_checkpoints para validar que o step existe."
         ),
         parameters={
@@ -220,7 +301,8 @@ def register_pipeline_replay_tools(
                     "description": (
                         "Nome do step para inspecionar. "
                         "Ex: 'classify' (antes de generate_pngs), "
-                        "'generate_pngs', 'add_shadows', etc."
+                        "'generate_pngs', 'add_shadows', "
+                        "'detect_silence' (silêncio), 'video_clipper' (b-rolls), etc."
                     ),
                 },
             },
@@ -288,11 +370,12 @@ def register_pipeline_replay_tools(
             "Re-executa o pipeline a partir de um step com modificações no estado. "
             "CRIA UM NOVO JOB — o vídeo será re-processado do step alvo até o render. "
             "Use quando a modificação exige re-gerar assets (cor, fonte, tamanho do texto, "
-            "backgrounds, sombras). "
+            "backgrounds, sombras), ajustar corte de silêncios (detect_silence), ou "
+            "reposicionar b-rolls (video_clipper). "
             f"Limite: {max_replays} replays por sessão. "
             "ATENÇÃO: Replay é mais custoso que modify_payload. "
             "Prefira modify_payload para posição, timing, animação, zoom. "
-            "Use replay APENAS quando a modificação exige re-gerar PNGs/assets. "
+            "Use replay APENAS quando a modificação exige re-gerar PNGs/assets ou re-processar steps. "
             "SEMPRE inspecione com get_step_payload antes de fazer replay."
         ),
         parameters={
@@ -306,12 +389,14 @@ def register_pipeline_replay_tools(
                     "type": "string",
                     "description": (
                         "Step a partir do qual re-executar. Exemplos:\n"
+                        "- 'detect_silence': ajustar corte de silêncios (sensibilidade, threshold)\n"
                         "- 'generate_pngs': mudar cor/fonte/tamanho do texto\n"
                         "- 'add_shadows': mudar sombras\n"
                         "- 'calculate_positions': mudar posição das legendas\n"
                         "- 'generate_backgrounds': mudar backgrounds/cartelas\n"
                         "- 'motion_graphics': re-gerar motion graphics\n"
-                        "- 'matting': ativar/desativar matting"
+                        "- 'matting': ativar/desativar matting\n"
+                        "- 'video_clipper': reposicionar b-rolls (regenera EDL via LLM)"
                     ),
                 },
                 "modifications": {
@@ -321,7 +406,10 @@ def register_pipeline_replay_tools(
                         '{"text_styles.default.font_config.font_color.value": [0, 0, 255, 255]}\n'
                         '{"text_styles.default.highlight.color.value": [0, 255, 0, 255]}\n'
                         '{"text_styles.default.font_config.font_size.value": 48}\n'
-                        '{"text_styles.default.font_config.font_family.value": "Poppins"}'
+                        '{"text_styles.default.font_config.font_family.value": "Poppins"}\n'
+                        '{"options.min_silence_duration": 0.3, "options.threshold_offset": 1}  (silêncio mais agressivo)\n'
+                        '{"options.min_silence_duration": 0.8, "options.threshold_offset": 5}  (mais respiro)\n'
+                        '{}  (video_clipper — regenera EDL via LLM, modifications vazio)'
                     ),
                 },
             },

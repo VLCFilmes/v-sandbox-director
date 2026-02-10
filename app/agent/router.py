@@ -5,7 +5,8 @@ Usa um modelo barato (gpt-4o-mini) SEM tools para classificar a instrução
 do usuário em uma rota:
 
 - payload  → PayloadSpecialist (posição, timing, animação, zoom)
-- replay   → ReplaySpecialist (cor, fonte, tamanho, background, matting)
+- replay   → ReplaySpecialist (cor, fonte, tamanho, background, matting,
+              corte de silêncios, posicionamento de b-rolls)
 - impossible → Resposta direta sem chamar LLM specialist
 
 Custo por chamada: ~$0.0005 (gpt-4o-mini, ~500 tokens)
@@ -48,6 +49,8 @@ Modificações que exigem RE-GERAR assets do pipeline (mais lento, ~35-60s):
 - Regenerar MOTION GRAPHICS
 - Ativar/desativar MATTING (recorte da pessoa)
 - Qualquer mudança visual que afete imagens PNG pré-renderizadas
+- Ajustar CORTE DE SILÊNCIOS (cortar mais/menos agressivamente, mudar sensibilidade)
+- Reposicionar B-ROLLS (mudar posicionamento de b-rolls, adicionar/remover b-rolls, ajustar duração)
 
 ## impossible
 Coisas que NÃO são possíveis:
