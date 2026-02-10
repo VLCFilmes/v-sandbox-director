@@ -180,6 +180,13 @@ class SandboxDirector:
         total_cost = 0.0
         sandbox_total_time_ms = 0
 
+        # 🆕 v4.4.2: Anti-alucinação + circuit breaker
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 3
+        # Tools "críticas" = as que efetivamente fazem alterações
+        CRITICAL_TOOLS = {"replay_from_step", "re_render", "modify_payload"}
+        critical_tool_results = []  # Lista de (tool_name, success, error_msg)
+
         # ═══ Tools no formato OpenAI (filtradas) ═══
         openai_tools = self.registry.get_openai_tools(
             self.allowed_tools or self.config.allowed_tools_list or None
@@ -302,9 +309,65 @@ class SandboxDirector:
                         f"{json.dumps(result, ensure_ascii=False)[:200]}"
                     )
 
+                    # 🆕 v4.4.2: Rastrear resultados de tools críticas
+                    if tool_name in CRITICAL_TOOLS:
+                        error_msg = result.get("error", "") if not is_success else ""
+                        critical_tool_results.append((tool_name, is_success, error_msg))
+
+                    # 🆕 v4.4.2: Circuit breaker — falhas consecutivas
+                    if is_success:
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            error_summary = (
+                                f"Múltiplas falhas consecutivas ({consecutive_failures}). "
+                                f"Última falha: {tool_name} → {result.get('error', 'erro desconhecido')}"
+                            )
+                            logger.warning(f"🛑 Circuit breaker ativado: {error_summary}")
+                            await db.complete_session(
+                                session_id, "error",
+                                error_message=f"Circuit breaker: {error_summary}",
+                            )
+                            yield {
+                                "type": "error",
+                                "status": "circuit_breaker",
+                                "result": (
+                                    f"Não foi possível completar a alteração. "
+                                    f"O sistema encontrou {consecutive_failures} erros seguidos. "
+                                    f"Detalhes: {error_summary}"
+                                ),
+                                "total_iterations": iteration,
+                                "total_cost": round(total_cost, 6),
+                            }
+                            return
+
             # ── CASO 2: Resposta final ──
             else:
                 result_text = assistant_message.content or "Concluído sem mensagem."
+
+                # 🆕 v4.4.2: Anti-alucinação — verificar se tools críticas tiveram sucesso
+                # Se a LLM diz que fez algo mas NENHUMA tool crítica teve sucesso,
+                # substituir a resposta por uma mensagem honesta de falha.
+                if critical_tool_results:
+                    any_critical_success = any(
+                        success for _, success, _ in critical_tool_results
+                    )
+                    if not any_critical_success:
+                        failed_details = "; ".join(
+                            f"{name}: {err}" for name, _, err in critical_tool_results if err
+                        )
+                        original_text = result_text
+                        result_text = (
+                            f"Não foi possível realizar a alteração solicitada. "
+                            f"As operações falharam: {failed_details}. "
+                            f"Isso pode acontecer quando o tipo de modificação não é suportado "
+                            f"neste contexto ou quando checkpoints necessários não estão disponíveis."
+                        )
+                        logger.warning(
+                            f"🛡️ [ANTI-HALLUCINATION] Resposta original substituída. "
+                            f"Original: '{original_text[:200]}' → Corrigida: '{result_text[:200]}'"
+                        )
 
                 logger.info(f"✅ Specialist concluiu em {iteration} iterações: {result_text[:200]}")
 
@@ -322,6 +385,13 @@ class SandboxDirector:
                     ),
                 )
 
+                # 🆕 v4.4.2: Determinar status real com base no anti-alucinação
+                all_critical_failed = (
+                    critical_tool_results
+                    and not any(s for _, s, _ in critical_tool_results)
+                )
+                final_status = "completed_with_errors" if all_critical_failed else "completed"
+
                 await db.update_session_counters(
                     session_id=session_id,
                     total_iterations=iteration,
@@ -335,18 +405,20 @@ class SandboxDirector:
                     sandbox_total_cost_usd=0,
                 )
                 await db.complete_session(
-                    session_id, "completed", result_summary=result_text
+                    session_id, final_status, result_summary=result_text
                 )
 
                 yield {
                     "type": "complete",
-                    "status": "completed",
+                    "status": final_status,
                     "result": result_text,
                     "session_id": session_id,
                     "total_iterations": iteration,
                     "total_tool_calls": total_tool_calls,
                     "total_cost": round(total_cost, 6),
                     "route": route,
+                    # 🆕 v4.4.2: Incluir detalhes de falha para o frontend
+                    **({"had_critical_failures": True} if all_critical_failed else {}),
                 }
                 return
 
