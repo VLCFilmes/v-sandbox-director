@@ -64,6 +64,7 @@ def register_pipeline_replay_tools(
             resp = await client.get(
                 f"{v_api_url}/api/video/job/{job_id}/checkpoints",
                 headers=headers,
+                params={"include_parent": "true"},
             )
 
             if resp.status_code != 200:
@@ -78,7 +79,10 @@ def register_pipeline_replay_tools(
                 cp["modifiable"] = step in STEP_MODIFICATION_MAP
                 cp["modification_type"] = STEP_MODIFICATION_MAP.get(step, "")
 
-            return {
+            # Se há root_job_id, incluir para que o LLM use no replay_from_step
+            root_job_id = data.get("root_job_id")
+            
+            result = {
                 "job_id": job_id,
                 "checkpoint_count": len(checkpoints),
                 "checkpoints": checkpoints,
@@ -87,6 +91,23 @@ def register_pipeline_replay_tools(
                     if cp.get("modifiable")
                 ],
             }
+            
+            if root_job_id:
+                result["root_job_id"] = root_job_id
+                # Identificar steps que vêm do parent (para hints)
+                parent_steps = [
+                    cp["step_name"] for cp in checkpoints
+                    if cp.get("from_parent")
+                ]
+                if parent_steps:
+                    result["parent_only_steps"] = parent_steps
+                    result["hint"] = (
+                        f"Este job é um replay. Steps {parent_steps} vêm do job original "
+                        f"({root_job_id[:8]}...). Para replay desses steps, use "
+                        f"root_job_id='{root_job_id}' como job_id no replay_from_step."
+                    )
+            
+            return result
 
     registry.register(
         name="list_pipeline_checkpoints",
@@ -123,6 +144,7 @@ def register_pipeline_replay_tools(
             resp = await client.get(
                 f"{v_api_url}/api/video/job/{job_id}/checkpoints/{step_name}",
                 headers=headers,
+                params={"include_parent": "true"},
             )
 
             if resp.status_code == 404:
@@ -315,12 +337,15 @@ def register_pipeline_replay_tools(
     async def replay_from_step(
         job_id: str,
         step_name: str,
-        modifications: dict,
+        modifications: dict = None,
     ) -> dict:
         """
         Re-executa o pipeline a partir de um step com modificações.
         Cria um novo job e enfileira para processamento.
         """
+        if modifications is None:
+            modifications = {}
+
         _replay_count["value"] += 1
         if _replay_count["value"] > max_replays:
             return {
@@ -413,7 +438,7 @@ def register_pipeline_replay_tools(
                     ),
                 },
             },
-            "required": ["job_id", "step_name", "modifications"],
+            "required": ["job_id", "step_name"],
         },
         handler=replay_from_step,
     )
