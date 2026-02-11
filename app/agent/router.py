@@ -51,10 +51,11 @@ Modificações que exigem RE-GERAR assets do pipeline (mais lento, ~35-60s):
 - Qualquer mudança visual que afete imagens PNG pré-renderizadas
 - Ajustar CORTE DE SILÊNCIOS (cortar mais/menos agressivamente, mudar sensibilidade)
 - Reposicionar B-ROLLS (mudar posicionamento de b-rolls, adicionar/remover b-rolls, ajustar duração)
+- Mudar TÍTULO do vídeo (texto, cor, fonte, posição, timing) — usa step `title_generation`
 
 ## impossible
 Coisas que NÃO são possíveis:
-- Mudar o conteúdo do texto (o que está escrito) — requer re-transcrição
+- Mudar o conteúdo das LEGENDAS (o que está escrito) — requer re-transcrição. ATENÇÃO: mudar o TÍTULO é possível via replay!
 - Mudar resolução/fps do vídeo — quebraria layout
 - Mudar o vídeo base — requer novo upload
 - Pedidos que não fazem sentido no contexto de edição de vídeo

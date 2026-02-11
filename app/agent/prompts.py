@@ -28,6 +28,7 @@ _SHARED_CONTEXT = """## Contexto do sistema de vídeo
 | `phrase_bgs` | BG de frases | PNG pré-renderizado |
 | `bg_full_screen` | Cartelas | PNG pré-renderizado |
 | `person_overlay` | Pessoa recortada | Vídeo luma matte |
+| `titles` | Título do vídeo | PNG pré-renderizado (overlay nos primeiros segundos) |
 | `motion_graphics` | Animações Manim | Vídeo transparente |
 
 ### Campos de cada item
@@ -178,6 +179,33 @@ Campos em `options.*` (dot-notation):
 - "Tirar só os silêncios grandes" → aumentar `min_silence_duration` (ex: 0.5→1.0)
 - "Cortar só bordas" → `options.cut_mode` = `"edges_only"`
 
+### Título do Vídeo (step alvo: `title_generation`)
+
+Replay a partir de `title_generation` re-executa: title_generation → render.
+O título é um overlay PNG renderizado nos primeiros segundos do vídeo.
+Campos em `title_overrides.*` (dot-notation):
+
+| Modificação | Campo EXATO | Formato | Dica |
+|---|---|---|---|
+| Texto da linha 1 (hook) | `title_overrides.line_1` | string | Ex: "CÂMERAS VINTAGE?" |
+| Texto da linha 2 (complemento) | `title_overrides.line_2` | string | Ex: "Veja isso!" (ou "" para remover) |
+| Posição | `title_overrides.position` | string | `"center_top"` (default), `"center"`, `"bottom_third"` |
+| Início (ms) | `title_overrides.timing_start_ms` | integer | Default: 0 (aparece no início) |
+| Fim (ms) | `title_overrides.timing_end_ms` | integer | Default: 4000 (4 segundos) |
+| Animação | `title_overrides.animation` | string | `"fade_in_up"` (default), `"scale_in"` |
+| Fonte | `title_overrides.png_style.fontFamily` | string | `"Poppins:style=Black"`, `"Poppins:style=Bold"` |
+| Cor do texto | `title_overrides.png_style.text_style.solid_color_rgb` | string `"R,G,B"` | Ex: `"255,255,255"` (branco) |
+| Cor da borda | `title_overrides.png_style.text_border_config.border_1_inner.color_rgb` | string `"R,G,B"` | Ex: `"0,0,0"` (preto) |
+| Espessura da borda | `title_overrides.png_style.text_border_config.border_1_inner.thickness_value` | integer | Default: 30 |
+| Tamanho linha 1 | `title_overrides.png_style.size_line1` | string | `"5%"` (% da altura do vídeo) |
+| Tamanho linha 2 | `title_overrides.png_style.size_line2` | string | `"3.5%"` |
+
+**Exemplos de ajuste:**
+- "Mude o título para X" → `{{"title_overrides.line_1": "NOVO TEXTO"}}`
+- "Título branco com borda preta" → `{{"title_overrides.png_style.text_style.solid_color_rgb": "255,255,255", "title_overrides.png_style.text_border_config.border_1_inner.color_rgb": "0,0,0"}}`
+- "Título maior" → `{{"title_overrides.png_style.size_line1": "6.5%", "title_overrides.png_style.size_line2": "4.5%"}}`
+- "Remover título" → `{{"title_overrides.line_1": "", "title_overrides.line_2": ""}}`
+
 ### Posicionamento de B-Rolls (step alvo: `video_clipper`)
 
 Replay a partir de `video_clipper` re-executa: video_clipper → ... → render.
@@ -239,6 +267,27 @@ O cache do EDL é limpo automaticamente durante o replay.
 2. replay_from_step(job_id, "video_clipper", {{}})
    (O Video Clipper regenera o EDL inteiro via LLM)
 
+## Exemplo: "Mude o título para CÂMERAS VINTAGE"
+1. list_pipeline_checkpoints(job_id) → confirmar que "title_generation" tem checkpoint
+2. replay_from_step(job_id, "title_generation", {{
+     "title_overrides.line_1": "CÂMERAS VINTAGE"
+   }})
+
+## Exemplo: "Título branco com borda preta e fonte maior"
+1. list_pipeline_checkpoints(job_id) → confirmar checkpoints
+2. replay_from_step(job_id, "title_generation", {{
+     "title_overrides.png_style.text_style.solid_color_rgb": "255,255,255",
+     "title_overrides.png_style.text_border_config.border_1_inner.color_rgb": "0,0,0",
+     "title_overrides.png_style.size_line1": "6.5%",
+     "title_overrides.png_style.size_line2": "4.5%"
+   }})
+
+## Exemplo: "Remover o título do vídeo"
+1. replay_from_step(job_id, "title_generation", {{
+     "title_overrides.line_1": "",
+     "title_overrides.line_2": ""
+   }})
+
 ## REGRAS CRÍTICAS
 - SEMPRE use os paths COMPLETOS começando com `text_styles.default.` para campos de texto
 - SEMPRE termine com `.value` nos campos que têm {{value, sidecar_id}}
@@ -246,6 +295,8 @@ O cache do EDL é limpo automaticamente durante o replay.
 - Se get_step_payload retornar `modifiable_fields`, use ESSES paths exatos
 - Para silêncios, use paths começando com `options.`
 - Para b-rolls, use replay com modifications vazio (o Video Clipper regenera via LLM)
+- Para título, use paths começando com `title_overrides.` — cores são strings "R,G,B" (NÃO arrays RGBA)
+- ATENÇÃO: cores de TÍTULO usam formato "R,G,B" (string), enquanto cores de LEGENDAS usam [R,G,B,A] (array). Não confunda!
 
 ## Limites
 - Máximo {max_iterations} iterações.
@@ -287,6 +338,7 @@ def build_system_prompt(
 - Matting → replay de `matting`
 - Corte de silêncios → replay de `detect_silence`
 - Reposicionar b-rolls → replay de `video_clipper`
+- Título do vídeo (texto, cor, fonte) → replay de `title_generation`
 
 ## DECISÃO: modify_payload vs replay_from_step
 "A modificação afeta algo renderizado como PNG?"

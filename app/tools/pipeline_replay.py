@@ -33,6 +33,7 @@ STEP_MODIFICATION_MAP = {
     "motion_graphics": "Motion graphics (Manim)",
     "matting": "Matting (pessoa recortada on/off)",
     "video_clipper": "Posicionamento de b-rolls (re-gera EDL via LLM semântica)",
+    "title_generation": "Título do vídeo (texto, cor, fonte, posição, timing)",
     "subtitle_pipeline": "Layout final de tracks e composição",
     "render": "Re-renderização com payload atual",
 }
@@ -244,6 +245,38 @@ def register_pipeline_replay_tools(
                         "segments_after_cut": len(cut_list),
                     }
 
+            # ═══ Title Generation fields ═══
+            elif step_name in ("title_generation", "subtitle_pipeline"):
+                title_overrides = state.get("title_overrides") or {}
+                title_track = state.get("title_track") or []
+                modifiable_fields = {
+                    "title_overrides.line_1": title_overrides.get("line_1", "(do roteiro)"),
+                    "title_overrides.line_2": title_overrides.get("line_2", "(do roteiro)"),
+                    "title_overrides.position": title_overrides.get("position", "center_top"),
+                    "title_overrides.timing_start_ms": title_overrides.get("timing_start_ms", 0),
+                    "title_overrides.timing_end_ms": title_overrides.get("timing_end_ms", 4000),
+                    "title_overrides.animation": title_overrides.get("animation", "fade_in_up"),
+                    "title_overrides.png_style.fontFamily": (title_overrides.get("png_style") or {}).get("fontFamily", "Poppins:style=Black"),
+                    "title_overrides.png_style.text_style.solid_color_rgb": "R,G,B (ex: 0,0,0 = preto)",
+                    "title_overrides.png_style.text_border_config.border_1_inner.color_rgb": "R,G,B (ex: 255,255,255 = branco)",
+                    "title_overrides.png_style.text_border_config.border_1_inner.thickness_value": 30,
+                    "title_overrides.png_style.size_line1": "5% (porcentagem da altura do vídeo)",
+                    "title_overrides.png_style.size_line2": "3.5%",
+                }
+                if title_track:
+                    relevant_fields["title_track_stats"] = {
+                        "items_count": len(title_track),
+                        "items_summary": [
+                            {
+                                "id": t.get("id"),
+                                "start_time": t.get("start_time"),
+                                "end_time": t.get("end_time"),
+                                "position": t.get("position"),
+                            }
+                            for t in title_track[:5]
+                        ],
+                    }
+
             # ═══ Video Clipper fields ═══
             elif step_name == "video_clipper":
                 video_clipper_track = state.get("video_clipper_track")
@@ -421,7 +454,8 @@ def register_pipeline_replay_tools(
                         "- 'generate_backgrounds': mudar backgrounds/cartelas\n"
                         "- 'motion_graphics': re-gerar motion graphics\n"
                         "- 'matting': ativar/desativar matting\n"
-                        "- 'video_clipper': reposicionar b-rolls (regenera EDL via LLM)"
+                        "- 'video_clipper': reposicionar b-rolls (regenera EDL via LLM)\n"
+                        "- 'title_generation': mudar título (texto, cor, fonte, posição, timing)"
                     ),
                 },
                 "modifications": {
